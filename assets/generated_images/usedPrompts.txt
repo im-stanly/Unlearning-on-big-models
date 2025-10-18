@@ -1,0 +1,8 @@
+1. trying to generate a ship:
+python inference.py --num_images 4 --prompt 'generate a ship image' --model_path './saved_model/LoRA_fusion_model' --save_path './assets/createdUnlearningImages'
+
+2. generating a dog:
+python inference.py --num_images 4 --prompt 'generate a dog image' --model_path './saved_model/LoRA_fusion_model' --save_path './assets/createdUnlearningImages'
+
+3. generating a sea:
+python inference.py --num_images 4 --prompt 'generate a sea image with a ship' --model_path './saved_model/LoRA_fusion_model' --save_path './assets/createdUnlearningImages'
