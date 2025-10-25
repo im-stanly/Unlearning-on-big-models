@@ -1,0 +1,5 @@
+# IDE configuration
+.idea
+
+# notebook outputs
+assets/ships_with_masks_plot.png
