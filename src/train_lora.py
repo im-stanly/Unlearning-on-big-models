@@ -96,7 +96,7 @@ def main():
     )
     dataset = LocalImageDataset(DATASET_PATH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    model, optimizer = accelerator.prepare(model, optimizer, dataloader)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     global_step = 0
 
     while global_step < MAX_STEPS:
