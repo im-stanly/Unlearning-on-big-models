@@ -20,6 +20,7 @@ EPOCHS = 100
 TRIGGER_WORD = "TOK"
 MODEL_ID = "black-forest-labs/FLUX.1-dev"
 OUTPUT_DIR = "./output"
+DATASET_PATH = ""
 
 
 class LocalImageDataset(Dataset):
@@ -93,7 +94,7 @@ def main():
         lora_layers,
         lr=LEARNING_RATE,
     )
-    dataset = LocalImageDataset("path")
+    dataset = LocalImageDataset(DATASET_PATH)
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
     model, optimizer = accelerator.prepare(model, optimizer, dataloader)
     global_step = 0
