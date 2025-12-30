@@ -4,182 +4,223 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from PIL import Image
+from tqdm.auto import tqdm
+
 from accelerate import Accelerator
-from diffusers import FluxPipeline, FlowMatchEulerDiscreteScheduler, FluxTransformer2DModel
+from diffusers import FluxPipeline
 from peft import LoraConfig, get_peft_model
+from diffusers.training_utils import compute_density_for_timestep_sampling
 
+# ==============================================================================
+# CONFIGURATION
+# ==============================================================================
 
-LEARNING_RATE = 1e-4
-LORA_RANK = 8
-GRAD_ACC_STEPS = 1
-MIXED_PRECISION = "bf16"
-SEED = 1234
-MAX_STEPS = 1000
-BATCH_SIZE = 4
-EPOCHS = 100
-TRIGGER_WORD = "TOK"
 MODEL_ID = "black-forest-labs/FLUX.1-dev"
-OUTPUT_DIR = "./output"
-DATASET_PATH = ""
+IMAGE_DIR = "../flux_lora_images"
+PROMPT = "a photo of TOK style"
+OUTPUT_DIR = "../models_cache/flux-lora"
+
+IMAGE_SIZE = 1024
+BATCH_SIZE = 1
+EPOCHS = 50
+LR = 1e-4
+RANK = 16
+
+# Flux VAE Normalization
+VAE_SCALE_FACTOR = 0.3611
+VAE_SHIFT_FACTOR = 0.1159
+
+# ==============================================================================
+# HELPER FUNCTIONS
+# ==============================================================================
+def prepare_img_ids(batch_size, height, width):
+    """Generates the rotary positional IDs."""
+    h_ids = torch.arange(height // 2)
+    w_ids = torch.arange(width // 2)
+    grid_h, grid_w = torch.meshgrid(h_ids, w_ids, indexing="ij")
+    img_ids = torch.stack([grid_h, grid_w], dim=-1).reshape(-1, 2)
+    img_ids = torch.cat([img_ids, torch.zeros(img_ids.shape[0], 1)], dim=-1)
+    # return img_ids.unsqueeze(0).repeat(batch_size, 1, 1)
+    return img_ids
+
+def pack_latents(latents, batch_size, channels, height, width):
+    """Packs (B, C, H, W) -> (B, L, C_packed)"""
+    latents = latents.view(batch_size, channels, height // 2, 2, width // 2, 2)
+    latents = latents.permute(0, 2, 4, 1, 3, 5)
+    latents = latents.reshape(batch_size, (height // 2) * (width // 2), channels * 4)
+    return latents
+
+def enable_gc(transformer):
+    if hasattr(transformer, "_set_gradient_checkpointing"):
+        transformer._set_gradient_checkpointing(True)
+    elif hasattr(transformer, "gradient_checkpointing"):
+        transformer.gradient_checkpointing = True
+    elif hasattr(transformer, "_gradient_checkpointing"):
+        transformer._gradient_checkpointing = True
+    else:
+        print("⚠️ Gradient checkpointing not supported")
 
 
-class LocalImageDataset(Dataset):
-    def __init__(self, directory, size=1024):
-        self.directory = directory
-        self.image_paths = [os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith(('.png', '.jpg'))]
+# ==============================================================================
+# DATASET
+# ==============================================================================
+class ImageDataset(Dataset):
+    def __init__(self, image_dir, size=1024):
+        self.paths = [
+            os.path.join(image_dir, f) for f in os.listdir(image_dir)
+            if f.lower().endswith((".png", ".jpg", ".jpeg"))
+        ]
         self.transform = transforms.Compose([
             transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(size),
             transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]), # Normalize to [-1, 1]
+            transforms.Normalize([0.5], [0.5]),
         ])
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.paths)
 
     def __getitem__(self, idx):
-        path = self.image_paths[idx]
-        image = Image.open(path).convert("RGB")
-        return self.transform(image)
+        try:
+            image = Image.open(self.paths[idx]).convert("RGB")
+            return self.transform(image)
+        except Exception:
+            return torch.zeros(3, 1024, 1024)
 
-
+# ==============================================================================
+# MAIN
+# ==============================================================================
 def main():
-    accelerator = Accelerator(
-        mixed_precision=MIXED_PRECISION,
-        gradient_accumulation_steps=GRAD_ACC_STEPS,
-    )
-    pipeline = FluxPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16)
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+    # 1. Setup Accelerator
+    accelerator = Accelerator(mixed_precision="bf16")
+    device = accelerator.device
+    weight_dtype = torch.bfloat16
 
-    pipeline.vae.requires_grad_(False)
-    pipeline.text_encoder.requires_grad_(False)
-    if hasattr(pipeline, 'text_encoder_2'):
-        pipeline.text_encoder_2.requires_grad_(False)
-    if hasattr(pipeline, 'transformer'):
-        pipeline.transformer.requires_grad_(False)
-    if hasattr(pipeline, 'unet'):
-        pipeline.unet.requires_grad_(False)
+    # 2. Load Pipeline
+    # This automatically loads CLIP, T5, VAE, Scheduler, and Transformer
+    print("Loading Flux Pipeline...")
+    pipe = FluxPipeline.from_pretrained(
+        MODEL_ID, 
+        torch_dtype=weight_dtype
+    ).to(device)
 
-    pipeline.safety_checker = None
-    inference_dtype = torch.float32
+    # 3. Freeze Components
+    # We only want to train the Transformer, so freeze everything else
+    pipe.vae.requires_grad_(False)
+    pipe.text_encoder.requires_grad_(False)   # CLIP
+    pipe.text_encoder_2.requires_grad_(False) # T5
+    pipe.transformer.requires_grad_(False)    # Freeze base transformer weights
 
-    if accelerator.mixed_precision == "fp16":
-        inference_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        inference_dtype = torch.bfloat16
-
-    pipeline.vae.to(accelerator.device)
-    pipeline.text_encoder.to(accelerator.device, dtype=inference_dtype)
-    pipeline.text_encoder_2.to(accelerator.device, dtype=inference_dtype)
-    pipeline.transformer.to(accelerator.device, dtype=inference_dtype)
-
-    print('Number of parameters:')
-    print(f'VAE: {sum(p.numel() for p in pipeline.vae.parameters())/1e6:.2f}M')
-    print(f'Text Encoder: {sum(p.numel() for p in pipeline.text_encoder.parameters())/1e6:.2f}M')
-    print(f'Text Encoder 2: {sum(p.numel() for p in pipeline.text_encoder_2.parameters())/1e6:.2f}M')
-    print(f'Transformer: {sum(p.numel() for p in pipeline.transformer.parameters())/1e6:.2f}M')
-
+    # 4. Attach LoRA to Transformer
     lora_config = LoraConfig(
-        r = LORA_RANK,
+        r=RANK,
+        lora_alpha=RANK,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        bias="none",
     )
-    pipeline.transformer.add_adapter(lora_config)
-    lora_layers = list(filter(lambda p: p.requires_grad, pipeline.transformer.parameters()))
-    assert len(lora_layers) > 0
-    model = pipeline.transformer
-    print(f'LoRA: {sum(p.numel() for p in lora_layers)/1e6:.2f}M')
+    pipe.transformer = get_peft_model(pipe.transformer, lora_config)
+    pipe.transformer.train()
+    
+    # Optional: Enable gradient checkpointing for memory savings
+    enable_gc(pipe.transformer)
 
+    # 5. Optimizer
     optimizer = torch.optim.AdamW(
-        lora_layers,
-        lr=LEARNING_RATE,
+        filter(lambda p: p.requires_grad, pipe.transformer.parameters()), 
+        lr=LR
     )
-    dataset = LocalImageDataset(DATASET_PATH)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    global_step = 0
 
-    while global_step < MAX_STEPS:
-        for batch in dataloader:
-            with accelerator.accumulate(pipeline):
+    # 6. Data & Accelerator Prepare
+    dataset = ImageDataset(IMAGE_DIR, size=IMAGE_SIZE)
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    
+    # Note: We pass pipe.transformer to prepare, not the whole pipe
+    pipe.transformer, optimizer, dataloader = accelerator.prepare(
+        pipe.transformer, optimizer, dataloader
+    )
+
+    # 7. Pre-compute Text Embeddings (Using the pipeline's encoders)
+    print("Encoding prompt...")
+    with torch.no_grad():
+        # Encode with CLIP (text_encoder)
+        clip_input = pipe.tokenizer(
+            PROMPT, padding="max_length", max_length=77, truncation=True, return_tensors="pt"
+        ).input_ids.to(device)
+        pooled_projections = pipe.text_encoder(clip_input).pooler_output
+
+        # Encode with T5 (text_encoder_2)
+        t5_input = pipe.tokenizer_2(
+            PROMPT, padding="max_length", max_length=512, truncation=True, return_tensors="pt"
+        ).input_ids.to(device)
+        encoder_hidden_states = pipe.text_encoder_2(t5_input)[0]
+
+    # 8. Training Loop
+    print("Starting training...")
+    for epoch in range(EPOCHS):
+        progress_bar = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}")
+        
+        for step, pixel_values in enumerate(progress_bar):
+            with accelerator.accumulate(pipe.transformer):
+                
+                # A. Encode Image (VAE)
                 with torch.no_grad():
-                    latents = pipeline.vae.encode(batch.to(accelerator.device).to(torch.bfloat16)).latent_dist.sample()
-                    latents = (latents - pipeline.vae.config.shift_factor) * pipeline.vae.config.scaling_factor
+                    latents = pipe.vae.encode(pixel_values.to(dtype=weight_dtype)).latent_dist.sample()
+                    latents = (latents - VAE_SHIFT_FACTOR) * VAE_SCALE_FACTOR
 
-                    prompt = f"Image in the style of {TRIGGER_WORD}"
-                    (
-                        prompt_embeds,
-                        pooled_prompt_embeds,
-                        text_ids,
-                    ) = pipeline.encode_prompt(prompt=prompt, prompt_2=prompt, device=accelerator.device)
+                # B. Prepare Inputs
+                bs, ch, h, w = latents.shape
+                packed_latents = pack_latents(latents, bs, ch, h, w).to(dtype=weight_dtype)
+                packed_latents.requires_grad_(True)
+                img_ids = prepare_img_ids(bs, h, w).to(device=device, dtype=weight_dtype)
+                txt_ids = torch.zeros(encoder_hidden_states.shape[1], 3, device=device, dtype=weight_dtype)
+                # txt_ids = torch.zeros(bs, encoder_hidden_states.shape[1], 3, device=device, dtype=weight_dtype)
 
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
+                # C. Noise & Timesteps
+                noise = torch.randn_like(packed_latents)
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme="logit_normal", batch_size=bs, logit_mean=0.0, logit_std=1.0
+                )
+                timesteps = u.to(device) 
 
-                u = torch.rand((bsz,), device=latents.device)
-                indices = (u * noise_scheduler.config.num_train_timesteps).long()
+                # D. Add Noise
+                sigmas = timesteps.view(-1, 1, 1)
+                noisy_latents = (1 - sigmas) * packed_latents + sigmas * noise
+                
+                # E. Forward Pass
+                print(f"DEBUG: Step {step} - Entering Transformer", flush=True)
+                target = noise - packed_latents
+                guidance_vec = torch.full((bs,), 1.0, device=device, dtype=weight_dtype)
 
-                # Add noise (Forward Process)
-                # Flux uses: x_t = (1 - t) * x_0 + t * x_1
-                sigmas = noise_scheduler.sigmas[indices].flatten()
-                while len(sigmas.shape) < len(latents.shape):
-                    sigmas = sigmas.unsqueeze(-1)
-
-                noisy_latents = (1 - sigmas) * latents + sigmas * noise
-
-                # 4. Predict
-                # Flux transformer expects "packed" latents, but Diffusers wrapper handles unpacking if configured correctly.
-                # Ideally, we pass the noisy latents directly.
-
-                # Prepare rotary embeddings (ids)
-                # This part is tricky in raw loops. Flux needs `img_ids`
-                # img_ids = torch.zeros((bsz, latents.shape[2], latents.shape[3], 3), device=latents.device) # Simplified
-                # (Ideally, you rely on the pipeline's internal prep, but here we call transformer directly)
-
-                # WARNING: Calling transformer directly requires correct `img_ids` and packed hidden states.
-                # To simplify this Minimal example, we rely on the fact that Diffusers' FluxTransformer2DModel
-                # can handle standard unpacked 4D inputs if configured, OR we accept that we must construct the IDs.
-
-                # Let's trust the model handles the shapes or use a helper from the pipeline if needed.
-                # For this snippet to run without 100 lines of ID prep, we assume standard inputs:
-
-                output = pipeline.transformer(
+                # Use pipe.transformer directly
+                model_pred = pipe.transformer(
                     hidden_states=noisy_latents,
-                    encoder_hidden_states=prompt_embeds,
-                    pooled_projections=pooled_prompt_embeds,
-                    timestep=sigmas.squeeze(), # Pass sigma as timestep for Flux
-                    txt_ids=text_ids,
-                    img_ids=pipeline.prepare_latents( # Borrowing ID prep from pipe for convenience
-                        bsz,
-                        latents.shape[1],
-                        latents.shape[2],
-                        latents.shape[3],
-                        prompt_embeds.dtype,
-                        accelerator.device
-                    )[2] # [2] is usually image_ids in the return tuple of prepare_latents
-                ).sample
+                    encoder_hidden_states=encoder_hidden_states,
+                    pooled_projections=pooled_projections,
+                    timestep=timesteps,
+                    img_ids=img_ids,
+                    txt_ids=txt_ids,
+                    guidance=guidance_vec,
+                    return_dict=False,
+                )[0]
+                print(f"DEBUG: Step {step} - Forward Done", flush=True)
 
-                # 5. Calculate Loss (Flow Matching)
-                # Target is usually (noise - latents) i.e., the velocity to move from data to noise
-                target = noise - latents
-                loss = F.mse_loss(output, target, reduction="mean")
-
-                # 6. Backprop
+                # F. Loss
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                print(f"DEBUG: Step {step} - Backward Start", flush=True)
                 accelerator.backward(loss)
+                print(f"DEBUG: Step {step} - Backward Done", flush=True)
                 optimizer.step()
                 optimizer.zero_grad()
+                
+                progress_bar.set_postfix(loss=loss.item())
+                print(f"Step {step} complete. Loss: {loss.item()}", flush=True)
 
-            if global_step % 10 == 0:
-                print(f"Step {global_step}: Loss {loss.item()}")
-
-            global_step += 1
-            if global_step >= MAX_STEPS:
-                break
-
-    # F. Save
-    print("Saving LoRA...")
-    pipeline.save_pretrained(OUTPUT_DIR)
-    print("Done!")
+    # 9. Save
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        pipe.transformer.save_pretrained(OUTPUT_DIR)
+        print(f"Saved to {OUTPUT_DIR}")
 
 if __name__ == "__main__":
     main()
